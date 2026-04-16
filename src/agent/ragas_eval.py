@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 import time
+import math
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -22,7 +23,7 @@ from ragas.metrics import (
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-
+from datetime import datetime
 
 # ── Test dataset ─────────────────────────────────────────────────────────────
 EVAL_QUESTIONS = [
@@ -170,7 +171,12 @@ def run_ragas_evaluation(use_live_agent: bool = False) -> dict:
             else:
                 score = float(values)
 
-            scores[metric_name] = round(score, 4) if score is not None else 0.0001
+            scores[metric_name] = (
+                round(score, 4)
+                if score is not None and not math.isnan(score)
+                else 0.0001
+            )
+            print(f"{metric_name}: {scores[metric_name]}")
 
         except Exception as e:
             print(f"Error in {metric_name}: {e}")
@@ -188,6 +194,7 @@ def run_ragas_evaluation(use_live_agent: bool = False) -> dict:
                 "scores": scores,
                 "num_questions": len(questions),
                 "model": "gemini-2.5-flash",
+                "timestamp": datetime.now().isoformat(),
             },
             f,
             indent=2,
