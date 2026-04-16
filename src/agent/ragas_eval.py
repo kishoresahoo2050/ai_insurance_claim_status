@@ -18,10 +18,10 @@ from ragas.metrics import (
     ContextPrecision,
     ContextRecall,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.embeddings import FakeEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
+
 
 # ── Test dataset ─────────────────────────────────────────────────────────────
 EVAL_QUESTIONS = [
@@ -120,12 +120,15 @@ def run_ragas_evaluation(use_live_agent: bool = False) -> dict:
         }
     )
 
-    # Configure RAGAS to use Anthropic LLM + fake embeddings
+    # ✅ LLM with timeout (VERY IMPORTANT)
     llm = ChatGoogleGenerativeAI(
         model="models/gemini-2.5-flash",
         temperature=0.2,
+        timeout=120,  # ⬅️ prevents TimeoutError
     )
-    embeddings = FakeEmbeddings(size=128)
+
+    # ✅ Embeddings
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
     ragas_llm = LangchainLLMWrapper(llm)
     ragas_embeddings = LangchainEmbeddingsWrapper(embeddings)
@@ -136,29 +139,54 @@ def run_ragas_evaluation(use_live_agent: bool = False) -> dict:
         ContextPrecision(),
         ContextRecall(),
     ]
-    for m in metrics:
-        m.llm = ragas_llm
-        if hasattr(m, "embeddings"):
-            m.embeddings = ragas_embeddings
+
+    # # Attach LLM + embeddings
+    # for m in metrics:
+    #     m.llm = ragas_llm
+    #     if hasattr(m, "embeddings"):
+    #         m.embeddings = ragas_embeddings
 
     print("Running RAGAS evaluation...")
-    results = evaluate(dataset, metrics=metrics)
+    scores = {}
 
-    scores = {
-        "faithfulness": round(float(results["faithfulness"]), 4),
-        "answer_relevancy": round(float(results["answer_relevancy"]), 4),
-        "context_precision": round(float(results["context_precision"]), 4),
-        "context_recall": round(float(results["context_recall"]), 4),
-    }
+    for metric in metrics:
+        print(f"Running {metric.name}")
 
+        result = evaluate(
+            dataset,
+            metrics=[metric],
+            llm=ragas_llm,
+            embeddings=ragas_embeddings,
+        )
+
+    # 🔥 Extract score safely
+    metric_name = metric.name
+
+    try:
+        values = result[metric_name]
+
+        if isinstance(values, list):
+            score = sum(v for v in values if v is not None) / len(values)
+        else:
+            score = float(values)
+
+        scores[metric_name] = round(score, 4)
+
+    except Exception as e:
+        print(f"Error in {metric_name}: {e}")
+        scores[metric_name] = 0.0
+
+    print("Final Scores:", scores)
     # Save results
     output_path = ROOT / "data" / "processed" / "ragas_results.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     with open(output_path, "w") as f:
         json.dump(
             {
                 "scores": scores,
                 "num_questions": len(questions),
-                "model": "claude-haiku-4-5-20251001",
+                "model": "gemini-2.5-flash",
             },
             f,
             indent=2,
