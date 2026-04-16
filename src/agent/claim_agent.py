@@ -1,6 +1,6 @@
 """
 LangGraph-powered Insurance Claim Agent
-Nodes: intent_classifier → claim_lookup → response_generator → output
+Nodes: intent_classifier → claim_lookup → rag_retriever → response_generator → output
 """
 
 import json
@@ -9,12 +9,14 @@ import sys
 from typing import TypedDict, Optional, List
 from pathlib import Path
 
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
+)
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import FakeEmbeddings
 from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
 
@@ -23,7 +25,7 @@ load_dotenv()
 # ── Path setup ──────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = ROOT / "data" / "synthetic"
-GLOSSARY_DIR = ROOT / "data" / "glossary"
+VECTOR_DB_PATH = ROOT / "data" / "vectorstore"
 
 sys.path.insert(0, str(ROOT))
 from data.glossary.insurance_terms import GLOSSARY, FAQ
@@ -33,6 +35,9 @@ llm = ChatGoogleGenerativeAI(
     model="models/gemini-2.5-flash",
     temperature=0.2,
 )
+
+# ── Embeddings ──────────────────────────────────────────────────────────────
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 
 # ── Load claim database ──────────────────────────────────────────────────────
@@ -48,9 +53,19 @@ def load_claims() -> dict:
 CLAIMS_DB = load_claims()
 
 
-# ── Build RAG vector store from glossary + FAQs ──────────────────────────────
+# ── Build / Load Vector Store ────────────────────────────────────────────────
 def build_vectorstore():
+    # ✅ Load existing DB
+    if VECTOR_DB_PATH.exists():
+        return FAISS.load_local(
+            str(VECTOR_DB_PATH),
+            embeddings,
+            allow_dangerous_deserialization=True,
+        )
+
+    # ✅ Create new DB
     docs = []
+
     for term, definition in GLOSSARY.items():
         docs.append(
             Document(
@@ -58,6 +73,7 @@ def build_vectorstore():
                 metadata={"type": "glossary", "term": term},
             )
         )
+
     for faq in FAQ:
         docs.append(
             Document(
@@ -65,8 +81,13 @@ def build_vectorstore():
                 metadata={"type": "faq"},
             )
         )
-    embeddings = FakeEmbeddings(size=128)
-    return FAISS.from_documents(docs, embeddings)
+
+    vectorstore = FAISS.from_documents(docs, embeddings)
+
+    # ✅ Save for reuse
+    vectorstore.save_local(str(VECTOR_DB_PATH))
+
+    return vectorstore
 
 
 VECTORSTORE = build_vectorstore()
@@ -110,16 +131,21 @@ Respond ONLY as JSON:
             HumanMessage(content=state["user_input"]),
         ]
     )
+
     result = llm.invoke(prompt.format_messages())
+
     try:
         text = result.content.strip()
         if "```" in text:
             text = text.split("```")[1].replace("json", "").strip()
         parsed = json.loads(text)
+
         state["intent"] = parsed.get("intent", "general_faq")
         state["claim_id"] = parsed.get("claim_id") or state.get("claim_id")
+
     except Exception:
         state["intent"] = "general_faq"
+
     return state
 
 
@@ -127,6 +153,7 @@ Respond ONLY as JSON:
 def claim_lookup(state: AgentState) -> AgentState:
     """Fetch claim data if a claim ID is present."""
     claim_id = state.get("claim_id")
+
     if claim_id and claim_id in CLAIMS_DB:
         state["claim_data"] = CLAIMS_DB[claim_id]
         state["error"] = None
@@ -138,6 +165,7 @@ def claim_lookup(state: AgentState) -> AgentState:
     else:
         state["claim_data"] = None
         state["error"] = None
+
     return state
 
 
@@ -147,6 +175,7 @@ def rag_retriever(state: AgentState) -> AgentState:
     query = state["user_input"]
     docs = VECTORSTORE.similarity_search(query, k=3)
     state["rag_context"] = [d.page_content for d in docs]
+
     return state
 
 
@@ -215,6 +244,7 @@ Please provide a clear, helpful response tailored to this customer's situation.
 
     result = llm.invoke(messages)
     state["response"] = result.content
+
     return state
 
 
@@ -271,7 +301,9 @@ def run_agent(
         "response": "",
         "error": None,
     }
+
     result = AGENT.invoke(state)
+
     return {
         "response": result["response"],
         "intent": result["intent"],
